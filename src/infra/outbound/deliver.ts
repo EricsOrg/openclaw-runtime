@@ -203,7 +203,12 @@ const GEC_DECISION_RE =
 export type GecEnforcementResult = {
   blocked: boolean;
   rewrittenText: string;
-  reason: "forbidden_future_tense_execution_promise" | "forbidden_hedging_without_decision" | null;
+  reason:
+    | "forbidden_future_tense_execution_promise"
+    | "forbidden_hedging_without_decision"
+    | "timeline_without_checkpoint"
+    | "channel_not_runtime_bound"
+    | null;
 };
 
 export type ExecutionWatchdogState = {
@@ -252,6 +257,8 @@ const MC_TASK_RE = /\btask(?:[_ -]?id)?\s*[:=]\s*([A-Za-z0-9_-]+)/i;
 const MC_TASK_LINK_RE = /https?:\/\/\S+\/tasks\/([A-Za-z0-9_-]+)/i;
 const NON_TRIVIAL_RE =
   /\b(code changes?|file writes?|deploy(?:ment)?|multi-step|checkpoint plan|closure packet|blocked packet|running tests?|\bbuild\b|executing now|i['’]ll do this now|implement|patch|commit|pr\b)\b/i;
+const TIMELINE_RE =
+  /\b(in\s+\d+\s*(minutes?|mins?|m|hours?|hrs?|h)|~\s*\d+\s*(minutes?|mins?|m|hours?|hrs?|h)|quickly|soon|shortly|right away)\b/i;
 
 const resolveExecutionWindowMs = (): number => {
   const raw = process.env.GEC_EXECUTION_WINDOW_MINS;
@@ -264,6 +271,29 @@ const hasProofSignal = (text: string): boolean => hasGecLegalEndState(text);
 
 const hasExecutionIntent = (text: string): boolean => GEC_EXECUTION_INTENT_RE.test(text);
 const isNonTrivialExecution = (text: string): boolean => NON_TRIVIAL_RE.test(text);
+const hasTimelineEstimate = (text: string): boolean => TIMELINE_RE.test(text);
+
+const isRuntimeBoundChannel = (
+  cfg: OpenClawConfig,
+  channel: string,
+  accountId?: string,
+): boolean => {
+  const channels = (cfg as OpenClawConfig & { channels?: Record<string, unknown> }).channels;
+  const channelCfg = channels?.[channel] as
+    | {
+        requiresRuntime?: boolean;
+        accounts?: Record<string, { requiresRuntime?: boolean }>;
+      }
+    | undefined;
+  if (!channelCfg) {
+    return true;
+  }
+  const accountCfg = accountId ? channelCfg.accounts?.[accountId] : undefined;
+  const accountFlag = accountCfg?.requiresRuntime;
+  const channelFlag = channelCfg.requiresRuntime;
+  const resolved = accountFlag ?? channelFlag;
+  return resolved !== false;
+};
 
 const extractTaskIdFromText = (text: string): string | undefined => {
   const direct = MC_TASK_RE.exec(text)?.[1];
@@ -505,6 +535,14 @@ export function buildGecCheckpointPlan(originalText: string): string {
   return `CHECKPOINT PLAN\n1) Capture objective + scope from request. Proof: objective statement logged.\n2) Execute exactly one bounded step toward objective. Proof: artifact path/command output.\n3) Return with one legal end state (Closure Packet / Blocked Packet / Checkpoint Plan) and evidence. Proof: end-state packet posted.\n\nObjective: ${objective}`;
 }
 
+export function buildTimelineCheckpointPlan(originalText: string): string {
+  const objective = (originalText || "Switch storage to persistent option")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
+  return `CHECKPOINT PLAN\n1) Switch storage to persistent option (Google Sheets/Airtable/Supabase). Proof: updated code + deploy URL.\n\nObjective: ${objective}`;
+}
+
 export function enforceGlobalExecutionConstitution(text: string): GecEnforcementResult {
   const raw = (text ?? "").trim();
   if (!raw) {
@@ -513,13 +551,18 @@ export function enforceGlobalExecutionConstitution(text: string): GecEnforcement
   const hasLegalState = hasGecLegalEndState(raw);
   const promiseViolation = GEC_PROMISE_RE.test(raw);
   const hedgingViolation = GEC_HEDGING_RE.test(raw) && !isDecisionRequestText(raw);
-  if (!hasLegalState && (promiseViolation || hedgingViolation)) {
+  const timelineViolation = hasTimelineEstimate(raw) && !hasLegalState;
+  if (!hasLegalState && (promiseViolation || hedgingViolation || timelineViolation)) {
     return {
       blocked: true,
-      rewrittenText: buildGecCheckpointPlan(raw),
+      rewrittenText: timelineViolation
+        ? buildTimelineCheckpointPlan(raw)
+        : buildGecCheckpointPlan(raw),
       reason: promiseViolation
         ? "forbidden_future_tense_execution_promise"
-        : "forbidden_hedging_without_decision",
+        : hedgingViolation
+          ? "forbidden_hedging_without_decision"
+          : "timeline_without_checkpoint",
     };
   }
   return { blocked: false, rewrittenText: raw, reason: null };
@@ -844,6 +887,33 @@ async function deliverOutboundPayloadsCore(
       mediaUrls: payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []),
       channelData: payload.channelData,
     };
+
+    if (
+      !isRuntimeBoundChannel(cfg, channel, accountId) &&
+      isNonTrivialExecution(payloadSummary.text)
+    ) {
+      const rewritten = buildGecCheckpointPlan(payloadSummary.text);
+      payloadSummary.text = rewritten;
+      if (sessionKeyForInternalHooks) {
+        void triggerInternalHook(
+          createInternalHookEvent("message", "policy_violation", sessionKeyForInternalHooks, {
+            policy: "global_execution_constitution",
+            gecVersion: GEC_VERSION,
+            reason: "POLICY_VIOLATION_CHANNEL",
+            channelId: channel,
+            accountId: accountId ?? undefined,
+            conversationId: to,
+            originalContent: payload.text ?? "",
+            rewrittenContent: rewritten,
+          }),
+        ).catch(() => {});
+      } else if (shouldEmitDedup(`policy_violation_channel:${channel}`, 5 * 60_000)) {
+        console.warn(
+          `[POLICY_VIOLATION_CHANNEL] global_execution_constitution gec_version=${GEC_VERSION} channel=${channel}`,
+        );
+      }
+    }
+
     const mcBinding = await ensureMissionControlBinding({
       text: payloadSummary.text,
       taskId: boundTaskId,
