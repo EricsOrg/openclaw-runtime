@@ -192,6 +192,50 @@ function createChannelOutboundContextBase(
 
 const isAbortError = (err: unknown): boolean => err instanceof Error && err.name === "AbortError";
 
+const GEC_LEGAL_END_STATES = ["CLOSURE PACKET", "BLOCKED PACKET", "CHECKPOINT PLAN"];
+const GEC_HEDGING_RE = /\b(if you want|would you like me to|i can|let me know if)\b/i;
+const GEC_PROMISE_RE =
+  /\b(i['’]ll\s+do|i\s+will\s+do|i['’]m\s+executing\s+now|i\s+am\s+executing\s+now|running\s+end-to-end)\b/i;
+const GEC_DECISION_RE = /\b(should i|do you want|would you like|which option|choose one|pick one|confirm)\b|\?/i;
+
+export type GecEnforcementResult = {
+  blocked: boolean;
+  rewrittenText: string;
+  reason: "forbidden_future_tense_execution_promise" | "forbidden_hedging_without_decision" | null;
+};
+
+const hasGecLegalEndState = (text: string): boolean => {
+  const upper = text.toUpperCase();
+  return GEC_LEGAL_END_STATES.some((token) => upper.includes(token));
+};
+
+const isDecisionRequestText = (text: string): boolean => GEC_DECISION_RE.test(text);
+
+export function buildGecCheckpointPlan(originalText: string): string {
+  const objective = (originalText || "Execution update").replace(/\s+/g, " ").trim().slice(0, 220);
+  return `CHECKPOINT PLAN\n1) Capture objective + scope from request. Proof: objective statement logged.\n2) Execute exactly one bounded step toward objective. Proof: artifact path/command output.\n3) Return with one legal end state (Closure Packet / Blocked Packet / Checkpoint Plan) and evidence. Proof: end-state packet posted.\n\nObjective: ${objective}`;
+}
+
+export function enforceGlobalExecutionConstitution(text: string): GecEnforcementResult {
+  const raw = (text ?? "").trim();
+  if (!raw) {
+    return { blocked: false, rewrittenText: raw, reason: null };
+  }
+  const hasLegalState = hasGecLegalEndState(raw);
+  const promiseViolation = GEC_PROMISE_RE.test(raw);
+  const hedgingViolation = GEC_HEDGING_RE.test(raw) && !isDecisionRequestText(raw);
+  if (!hasLegalState && (promiseViolation || hedgingViolation)) {
+    return {
+      blocked: true,
+      rewrittenText: buildGecCheckpointPlan(raw),
+      reason: promiseViolation
+        ? "forbidden_future_tense_execution_promise"
+        : "forbidden_hedging_without_decision",
+    };
+  }
+  return { blocked: false, rewrittenText: raw, reason: null };
+}
+
 type DeliverOutboundPayloadsCoreParams = {
   cfg: OpenClawConfig;
   channel: Exclude<OutboundChannel, "none">;
@@ -453,6 +497,27 @@ async function deliverOutboundPayloadsCore(
       mediaUrls: payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []),
       channelData: payload.channelData,
     };
+    const gec = enforceGlobalExecutionConstitution(payloadSummary.text);
+    if (gec.blocked) {
+      payloadSummary.text = gec.rewrittenText;
+      if (sessionKeyForInternalHooks) {
+        void triggerInternalHook(
+          createInternalHookEvent("message", "policy_violation", sessionKeyForInternalHooks, {
+            policy: "global_execution_constitution",
+            reason: gec.reason,
+            channelId: channel,
+            accountId: accountId ?? undefined,
+            conversationId: to,
+            originalContent: payload.text ?? "",
+            rewrittenContent: gec.rewrittenText,
+          }),
+        ).catch(() => {});
+      } else {
+        console.warn(
+          `[POLICY_VIOLATION] global_execution_constitution channel=${channel} reason=${gec.reason}`,
+        );
+      }
+    }
     const emitMessageSent = (params: {
       success: boolean;
       content: string;
@@ -496,7 +561,12 @@ async function deliverOutboundPayloadsCore(
       throwIfAborted(abortSignal);
 
       // Run message_sending plugin hook (may modify content or cancel)
-      let effectivePayload = payload;
+      let effectivePayload: ReplyPayload = gec.blocked
+        ? {
+            ...payload,
+            text: payloadSummary.text,
+          }
+        : payload;
       if (hookRunner?.hasHooks("message_sending")) {
         try {
           const sendingResult = await hookRunner.runMessageSending(
