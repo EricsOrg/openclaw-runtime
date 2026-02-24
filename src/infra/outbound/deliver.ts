@@ -279,6 +279,16 @@ const chooseDefaultOwnerAgent = (text: string): string =>
     : "cb-router";
 
 let mcBindingLogEmitted = false;
+const outboundDedupeState = new Map<string, number>();
+
+export function shouldEmitDedup(key: string, windowMs: number, nowMs = Date.now()): boolean {
+  const last = outboundDedupeState.get(key) ?? 0;
+  if (nowMs - last < windowMs) {
+    return false;
+  }
+  outboundDedupeState.set(key, nowMs);
+  return true;
+}
 
 const resolveMcTimeoutMs = (): number => {
   const parsed = Number(process.env.MC_TIMEOUT_MS ?? "7000");
@@ -881,7 +891,7 @@ async function deliverOutboundPayloadsCore(
             rewrittenContent: gec.rewrittenText,
           }),
         ).catch(() => {});
-      } else {
+      } else if (shouldEmitDedup(`policy_violation:${channel}:${gec.reason}`, 5 * 60_000)) {
         console.warn(
           `[POLICY_VIOLATION] global_execution_constitution gec_version=${GEC_VERSION} channel=${channel} reason=${gec.reason}`,
         );
@@ -987,7 +997,7 @@ async function deliverOutboundPayloadsCore(
               rewrittenContent: watchdog.rewrittenText,
             }),
           ).catch(() => {});
-        } else {
+        } else if (shouldEmitDedup(`execution_window_exceeded:${channel}`, 5 * 60_000)) {
           console.warn(
             `[POLICY_VIOLATION] EXECUTION_WINDOW_EXCEEDED gec_version=${GEC_VERSION} channel=${channel}`,
           );
