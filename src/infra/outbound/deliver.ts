@@ -197,12 +197,26 @@ const GEC_LEGAL_END_STATES = ["CLOSURE PACKET", "BLOCKED PACKET", "CHECKPOINT PL
 const GEC_HEDGING_RE = /\b(if you want|would you like me to|i can|let me know if)\b/i;
 const GEC_PROMISE_RE =
   /\b(i['’]ll\s+do|i\s+will\s+do|i['’]m\s+executing\s+now|i\s+am\s+executing\s+now|running\s+end-to-end)\b/i;
-const GEC_DECISION_RE = /\b(should i|do you want|would you like|which option|choose one|pick one|confirm)\b|\?/i;
+const GEC_DECISION_RE =
+  /\b(should i|do you want|would you like|which option|choose one|pick one|confirm)\b|\?/i;
 
 export type GecEnforcementResult = {
   blocked: boolean;
   rewrittenText: string;
   reason: "forbidden_future_tense_execution_promise" | "forbidden_hedging_without_decision" | null;
+};
+
+export type ExecutionWatchdogState = {
+  active: boolean;
+  startedAtMs: number;
+  lastProofAtMs: number;
+};
+
+export type ExecutionWatchdogResult = {
+  state: ExecutionWatchdogState;
+  timedOut: boolean;
+  rewrittenText: string;
+  reason: "execution_window_exceeded" | null;
 };
 
 const hasGecLegalEndState = (text: string): boolean => {
@@ -211,6 +225,20 @@ const hasGecLegalEndState = (text: string): boolean => {
 };
 
 const isDecisionRequestText = (text: string): boolean => GEC_DECISION_RE.test(text);
+const GEC_EXECUTION_INTENT_RE =
+  /\b(i['’]m\s+executing|i\s+am\s+executing|running\s+end-to-end|working\s+on\s+it|executing\s+now|starting\s+execution)\b/i;
+const GEC_EXECUTION_WINDOW_DEFAULT_MINS = 10;
+
+const resolveExecutionWindowMs = (): number => {
+  const raw = process.env.GEC_EXECUTION_WINDOW_MINS;
+  const parsed = raw ? Number(raw) : GEC_EXECUTION_WINDOW_DEFAULT_MINS;
+  const mins = Number.isFinite(parsed) && parsed > 0 ? parsed : GEC_EXECUTION_WINDOW_DEFAULT_MINS;
+  return mins * 60 * 1000;
+};
+
+const hasProofSignal = (text: string): boolean => hasGecLegalEndState(text);
+
+const hasExecutionIntent = (text: string): boolean => GEC_EXECUTION_INTENT_RE.test(text);
 
 export function buildGecCheckpointPlan(originalText: string): string {
   const objective = (originalText || "Execution update").replace(/\s+/g, " ").trim().slice(0, 220);
@@ -235,6 +263,57 @@ export function enforceGlobalExecutionConstitution(text: string): GecEnforcement
     };
   }
   return { blocked: false, rewrittenText: raw, reason: null };
+}
+
+export function evaluateExecutionWatchdog(params: {
+  text: string;
+  state: ExecutionWatchdogState;
+  nowMs?: number;
+  windowMs?: number;
+}): ExecutionWatchdogResult {
+  const nowMs = params.nowMs ?? Date.now();
+  const windowMs = params.windowMs ?? resolveExecutionWindowMs();
+  const raw = (params.text ?? "").trim();
+  let state = params.state;
+
+  if (!raw) {
+    return { state, timedOut: false, rewrittenText: raw, reason: null };
+  }
+  if (hasProofSignal(raw)) {
+    return {
+      state: {
+        active: false,
+        startedAtMs: state.startedAtMs,
+        lastProofAtMs: nowMs,
+      },
+      timedOut: false,
+      rewrittenText: raw,
+      reason: null,
+    };
+  }
+
+  if (!state.active && hasExecutionIntent(raw)) {
+    state = {
+      active: true,
+      startedAtMs: nowMs,
+      lastProofAtMs: nowMs,
+    };
+    return { state, timedOut: false, rewrittenText: raw, reason: null };
+  }
+
+  if (state.active && nowMs - state.lastProofAtMs > windowMs) {
+    return {
+      state: {
+        ...state,
+        active: false,
+      },
+      timedOut: true,
+      rewrittenText: buildGecCheckpointPlan(raw),
+      reason: "execution_window_exceeded",
+    };
+  }
+
+  return { state, timedOut: false, rewrittenText: raw, reason: null };
 }
 
 type DeliverOutboundPayloadsCoreParams = {
@@ -492,6 +571,11 @@ async function deliverOutboundPayloadsCore(
   });
   const hookRunner = getGlobalHookRunner();
   const sessionKeyForInternalHooks = params.mirror?.sessionKey ?? params.sessionKey;
+  let watchdogState: ExecutionWatchdogState = {
+    active: false,
+    startedAtMs: Date.now(),
+    lastProofAtMs: Date.now(),
+  };
   for (const payload of normalizedPayloads) {
     const payloadSummary: NormalizedOutboundPayload = {
       text: payload.text ?? "",
@@ -594,6 +678,39 @@ async function deliverOutboundPayloadsCore(
         }
       }
 
+      let abortAfterThisPayload = false;
+      const watchdog = evaluateExecutionWatchdog({
+        text: payloadSummary.text,
+        state: watchdogState,
+      });
+      watchdogState = watchdog.state;
+      if (watchdog.timedOut) {
+        abortAfterThisPayload = true;
+        payloadSummary.text = watchdog.rewrittenText;
+        effectivePayload = {
+          ...effectivePayload,
+          text: watchdog.rewrittenText,
+        };
+        if (sessionKeyForInternalHooks) {
+          void triggerInternalHook(
+            createInternalHookEvent("message", "policy_violation", sessionKeyForInternalHooks, {
+              policy: "global_execution_constitution",
+              gecVersion: GEC_VERSION,
+              reason: "EXECUTION_WINDOW_EXCEEDED",
+              channelId: channel,
+              accountId: accountId ?? undefined,
+              conversationId: to,
+              originalContent: payload.text ?? "",
+              rewrittenContent: watchdog.rewrittenText,
+            }),
+          ).catch(() => {});
+        } else {
+          console.warn(
+            `[POLICY_VIOLATION] EXECUTION_WINDOW_EXCEEDED gec_version=${GEC_VERSION} channel=${channel}`,
+          );
+        }
+      }
+
       params.onPayload?.(payloadSummary);
       const sendOverrides = {
         replyToId: effectivePayload.replyToId ?? params.replyToId ?? undefined,
@@ -607,6 +724,9 @@ async function deliverOutboundPayloadsCore(
           content: payloadSummary.text,
           messageId: delivery.messageId,
         });
+        if (abortAfterThisPayload) {
+          return results;
+        }
         continue;
       }
       if (payloadSummary.mediaUrls.length === 0) {
@@ -622,6 +742,9 @@ async function deliverOutboundPayloadsCore(
           content: payloadSummary.text,
           messageId,
         });
+        if (abortAfterThisPayload) {
+          return results;
+        }
         continue;
       }
 
@@ -646,6 +769,9 @@ async function deliverOutboundPayloadsCore(
         content: payloadSummary.text,
         messageId: lastMessageId,
       });
+      if (abortAfterThisPayload) {
+        return results;
+      }
     } catch (err) {
       emitMessageSent({
         success: false,
