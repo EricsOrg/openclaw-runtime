@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+import os from "node:os";
 import {
   type Block,
   type FilesUploadV2Arguments,
@@ -81,6 +83,45 @@ function isSlackCustomizeScopeError(err: unknown): boolean {
   return scopes.includes("chat:write.customize");
 }
 
+function textHashPreview(text: string): string {
+  const normalized = text.trim();
+  if (!normalized) {
+    return "empty";
+  }
+  return crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+
+function resolveSlackRequestId(value: unknown): string {
+  if (!value || typeof value !== "object") {
+    return "n/a";
+  }
+  const candidate = (value as { response_metadata?: { request_id?: string } }).response_metadata
+    ?.request_id;
+  return candidate?.trim() || "n/a";
+}
+
+function logSlackSendCorrelation(params: {
+  ok: boolean;
+  channelId: string;
+  messageTs?: string;
+  text: string;
+  requestId?: string;
+  error?: string;
+}) {
+  const host = os.hostname();
+  const hash = textHashPreview(params.text);
+  const requestId = params.requestId?.trim() || "n/a";
+  if (params.ok) {
+    console.log(
+      `[SLACK_SEND] ok=true provider=slack channel_id=${params.channelId} ts=${params.messageTs ?? "unknown"} text_hash=${hash} request_id=${requestId} host=${host}`,
+    );
+    return;
+  }
+  console.log(
+    `[SLACK_SEND] ok=false provider=slack channel_id=${params.channelId} ts=unknown text_hash=${hash} request_id=${requestId} error=${(params.error ?? "unknown").replace(/\s+/g, " ")} host=${host}`,
+  );
+}
+
 async function postSlackMessageBestEffort(params: {
   client: WebClient;
   channelId: string;
@@ -99,29 +140,70 @@ async function postSlackMessageBestEffort(params: {
     // Slack Web API types model icon_url and icon_emoji as mutually exclusive.
     // Build payloads in explicit branches so TS and runtime stay aligned.
     if (params.identity?.iconUrl) {
-      return await params.client.chat.postMessage({
+      const response = await params.client.chat.postMessage({
         ...basePayload,
         ...(params.identity.username ? { username: params.identity.username } : {}),
         icon_url: params.identity.iconUrl,
       });
+      logSlackSendCorrelation({
+        ok: true,
+        channelId: params.channelId,
+        messageTs: response.ts,
+        text: params.text,
+        requestId: resolveSlackRequestId(response),
+      });
+      return response;
     }
     if (params.identity?.iconEmoji) {
-      return await params.client.chat.postMessage({
+      const response = await params.client.chat.postMessage({
         ...basePayload,
         ...(params.identity.username ? { username: params.identity.username } : {}),
         icon_emoji: params.identity.iconEmoji,
       });
+      logSlackSendCorrelation({
+        ok: true,
+        channelId: params.channelId,
+        messageTs: response.ts,
+        text: params.text,
+        requestId: resolveSlackRequestId(response),
+      });
+      return response;
     }
-    return await params.client.chat.postMessage({
+    const response = await params.client.chat.postMessage({
       ...basePayload,
       ...(params.identity?.username ? { username: params.identity.username } : {}),
     });
+    logSlackSendCorrelation({
+      ok: true,
+      channelId: params.channelId,
+      messageTs: response.ts,
+      text: params.text,
+      requestId: resolveSlackRequestId(response),
+    });
+    return response;
   } catch (err) {
     if (!hasCustomIdentity(params.identity) || !isSlackCustomizeScopeError(err)) {
+      const error = err instanceof Error ? err.message : String(err);
+      const requestId = resolveSlackRequestId(err);
+      logSlackSendCorrelation({
+        ok: false,
+        channelId: params.channelId,
+        text: params.text,
+        requestId,
+        error,
+      });
       throw err;
     }
     logVerbose("slack send: missing chat:write.customize, retrying without custom identity");
-    return params.client.chat.postMessage(basePayload);
+    const response = await params.client.chat.postMessage(basePayload);
+    logSlackSendCorrelation({
+      ok: true,
+      channelId: params.channelId,
+      messageTs: response.ts,
+      text: params.text,
+      requestId: resolveSlackRequestId(response),
+    });
+    return response;
   }
 }
 
