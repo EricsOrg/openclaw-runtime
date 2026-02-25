@@ -6,6 +6,9 @@ const GEC_DECISION_RE =
   /\b(should i|do you want|would you like|which option|choose one|pick one|confirm|choose a or b)\b|\?/i;
 const EXECUTION_INTENT_RE =
   /\b(i['’]m\s+executing|i\s+am\s+executing|running\s+end-to-end|working\s+on\s+it|executing\s+now|starting\s+execution)\b/i;
+const LEGAL_END_STATE_RE = /\b(CLOSURE PACKET|BLOCKED PACKET|CHECKPOINT PLAN)\b/i;
+const ILLEGAL_OUTBOUND_RE =
+  /(https?:\/\/|\bLive URL\b|\bdeployed\b|\bit['’]s live\b|\bDone\s*—\b|\bbuilt and deployed\b|\bvercel\.app\b)/i;
 
 const dedupe = new Map();
 function shouldEmitDedup(key, windowMs, nowMs = Date.now()) {
@@ -35,6 +38,37 @@ function isRuntimeBoundChannel(cfg, channel, accountId, chatType) {
     return true;
   }
   return resolved !== false;
+}
+
+function buildSendGuardRewriteText(originalText, env = {}) {
+  const missing = [];
+  if (!(env.MC_API_URL || "").trim()) {
+    missing.push("MC_API_URL");
+  }
+  if (!(env.MC_API_TOKEN || "").trim()) {
+    missing.push("MC_API_TOKEN");
+  }
+  const appBase =
+    (env.MC_APP_BASE_URL || "").trim() ||
+    (env.MC_API_URL || "").replace(/\/$/, "").replace(/\/api(?:\/runtime)?$/i, "");
+  if (missing.length > 0) {
+    return `BLOCKED PACKET\nMissing requirement: ${missing.join(", ")}\nRequired next step: configure Mission Control runtime env vars before publish claims.`;
+  }
+  const taskLink = appBase
+    ? `${appBase.replace(/\/$/, "")}/tasks/new`
+    : "<MC task link unavailable>";
+  const objective = originalText.replace(/\s+/g, " ").trim().slice(0, 180);
+  return `MC Task: ${taskLink}\nCHECKPOINT PLAN\n1) Create/bind Mission Control task before publish/deploy claims. Proof: task link.\n2) Execute one bounded step and capture evidence (commit/deploy output). Proof: evidence artifact.\n3) Return with legal end-state packet (Closure/Blocked/Checkpoint).\n\nObjective: ${objective}`;
+}
+
+function applySlackSendGuard(text, env = {}) {
+  const hasIllegal = ILLEGAL_OUTBOUND_RE.test(text);
+  const hasMcTask = /\bMC Task:\b/i.test(text);
+  const hasLegalState = LEGAL_END_STATE_RE.test(text);
+  if (hasIllegal && !(hasMcTask && hasLegalState)) {
+    return { blocked: true, text: buildSendGuardRewriteText(text, env) };
+  }
+  return { blocked: false, text };
 }
 
 function buildCheckpoint(text) {
@@ -272,6 +306,19 @@ results.push(
     ),
   ),
 );
+
+// 9 Send-time guard catches bypassed illegal outbound claims
+const bypassText = "Done — Live URL: <https://x.vercel.app>";
+const guardOut = applySlackSendGuard(bypassText, {
+  MC_API_URL: "https://mission-control-mocha-tau.vercel.app/api/runtime",
+  MC_APP_BASE_URL: "https://mission-control-mocha-tau.vercel.app",
+  MC_API_TOKEN: "present",
+});
+const t9 =
+  guardOut.blocked &&
+  guardOut.text.includes("MC Task:") &&
+  guardOut.text.includes("CHECKPOINT PLAN");
+results.push(pass("9_send_guard_rewrites_illegal_bypass", t9, JSON.stringify(guardOut, null, 2)));
 
 const allPass = results.every(Boolean);
 console.log(`\nRESULT: ${allPass ? "PASS" : "FAIL"}`);

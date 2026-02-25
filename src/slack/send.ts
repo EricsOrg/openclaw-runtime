@@ -25,6 +25,9 @@ import { parseSlackTarget } from "./targets.js";
 import { resolveSlackBotToken } from "./token.js";
 
 const SLACK_TEXT_LIMIT = 4000;
+const LEGAL_END_STATE_RE = /\b(CLOSURE PACKET|BLOCKED PACKET|CHECKPOINT PLAN)\b/i;
+const ILLEGAL_OUTBOUND_RE =
+  /(https?:\/\/|\bLive URL\b|\bdeployed\b|\bit['’]s live\b|\bDone\s*—\b|\bbuilt and deployed\b|\bvercel\.app\b)/i;
 
 type SlackRecipient =
   | {
@@ -120,6 +123,46 @@ function logSlackSendCorrelation(params: {
   console.log(
     `[SLACK_SEND] ok=false provider=slack channel_id=${params.channelId} ts=unknown text_hash=${hash} request_id=${requestId} error=${(params.error ?? "unknown").replace(/\s+/g, " ")} host=${host}`,
   );
+}
+
+function buildSendGuardRewriteText(originalText: string): string {
+  const missing: string[] = [];
+  if (!process.env.MC_API_URL?.trim()) {
+    missing.push("MC_API_URL");
+  }
+  if (!process.env.MC_API_TOKEN?.trim()) {
+    missing.push("MC_API_TOKEN");
+  }
+  const appBase =
+    process.env.MC_APP_BASE_URL?.trim() ||
+    process.env.MC_API_URL?.trim()
+      ?.replace(/\/$/, "")
+      .replace(/\/api(?:\/runtime)?$/i, "");
+  if (missing.length > 0) {
+    return `BLOCKED PACKET\nMissing requirement: ${missing.join(", ")}\nRequired next step: configure Mission Control runtime env vars before publish claims.`;
+  }
+  const taskLink = appBase
+    ? `${appBase.replace(/\/$/, "")}/tasks/new`
+    : "<MC task link unavailable>";
+  const objective = originalText.replace(/\s+/g, " ").trim().slice(0, 180);
+  return `MC Task: ${taskLink}\nCHECKPOINT PLAN\n1) Create/bind Mission Control task before publish/deploy claims. Proof: task link.\n2) Execute one bounded step and capture evidence (commit/deploy output). Proof: evidence artifact.\n3) Return with legal end-state packet (Closure/Blocked/Checkpoint).\n\nObjective: ${objective}`;
+}
+
+function applySlackSendGuard(text: string, channelId: string): { blocked: boolean; text: string } {
+  const hasIllegal = ILLEGAL_OUTBOUND_RE.test(text);
+  const hasMcTask = /\bMC Task:\b/i.test(text);
+  const hasLegalState = LEGAL_END_STATE_RE.test(text);
+  if (hasIllegal && !(hasMcTask && hasLegalState)) {
+    const textHash = textHashPreview(text);
+    console.warn(
+      `[POLICY_GUARD_SEND] blocked_illegal_outbound provider=slack channel_id=${channelId} text_hash=${textHash}`,
+    );
+    console.warn(
+      `[POLICY_VIOLATION_SEND_GUARD] provider=slack channel_id=${channelId} text_hash=${textHash}`,
+    );
+    return { blocked: true, text: buildSendGuardRewriteText(text) };
+  }
+  return { blocked: false, text };
 }
 
 async function postSlackMessageBestEffort(params: {
@@ -331,15 +374,19 @@ export async function sendMessageSlack(
   const client = opts.client ?? createSlackWebClient(token);
   const recipient = parseRecipient(to);
   const { channelId } = await resolveChannelId(client, recipient);
+  const guardedPrimary = applySlackSendGuard(trimmedMessage, channelId);
+  const effectivePrimaryText = guardedPrimary.text;
+
   if (blocks) {
     if (opts.mediaUrl) {
       throw new Error("Slack send does not support blocks with mediaUrl");
     }
-    const fallbackText = trimmedMessage || buildSlackBlocksFallbackText(blocks);
+    const fallbackText = effectivePrimaryText || buildSlackBlocksFallbackText(blocks);
+    const guardedFallback = applySlackSendGuard(fallbackText, channelId);
     const response = await postSlackMessageBestEffort({
       client,
       channelId,
-      text: fallbackText,
+      text: guardedFallback.text,
       threadTs: opts.threadTs,
       identity: opts.identity,
       blocks,
@@ -359,13 +406,13 @@ export async function sendMessageSlack(
   const chunkMode = resolveChunkMode(cfg, "slack", account.accountId);
   const markdownChunks =
     chunkMode === "newline"
-      ? chunkMarkdownTextWithMode(trimmedMessage, chunkLimit, chunkMode)
-      : [trimmedMessage];
+      ? chunkMarkdownTextWithMode(effectivePrimaryText, chunkLimit, chunkMode)
+      : [effectivePrimaryText];
   const chunks = markdownChunks.flatMap((markdown) =>
     markdownToSlackMrkdwnChunks(markdown, chunkLimit, { tableMode }),
   );
-  if (!chunks.length && trimmedMessage) {
-    chunks.push(trimmedMessage);
+  if (!chunks.length && effectivePrimaryText) {
+    chunks.push(effectivePrimaryText);
   }
   const mediaMaxBytes =
     typeof account.config.mediaMaxMb === "number"
