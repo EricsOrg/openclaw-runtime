@@ -504,6 +504,27 @@ describe("listSessionsFromStore search", () => {
     }
   });
 
+  test("prefers agent id for agent main sessions over stale displayName", () => {
+    const now = Date.now();
+    const store: Record<string, SessionEntry> = {
+      "agent:eli-mc-frontend:main": {
+        sessionId: "sess-eli",
+        updatedAt: now,
+        displayName: "heartbeat",
+        lastTo: "heartbeat",
+      } as SessionEntry,
+    };
+
+    const result = listSessionsFromStore({
+      cfg: baseCfg,
+      storePath: "/tmp/sessions.json",
+      store,
+      opts: {},
+    });
+
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].displayName).toBe("eli-mc-frontend");
+  });
   test("hides cron run alias session keys from sessions list", () => {
     const now = Date.now();
     const store: Record<string, SessionEntry> = {

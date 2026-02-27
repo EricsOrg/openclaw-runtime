@@ -147,6 +147,22 @@ function truncateTitle(text: string, maxLen: number): string {
   return cut + "…";
 }
 
+function resolveAgentSessionDisplayName(
+  cfg: OpenClawConfig,
+  sessionKey: string,
+): string | undefined {
+  const parsed = parseAgentSessionKey(sessionKey);
+  if (!parsed) {
+    return undefined;
+  }
+  const rest = parsed.rest.trim().toLowerCase();
+  const mainKey = normalizeMainKey(cfg.session?.mainKey ?? "main");
+  if (rest !== mainKey && rest !== "main") {
+    return undefined;
+  }
+  return normalizeAgentId(parsed.agentId);
+}
+
 export function deriveSessionTitle(
   entry: SessionEntry | undefined,
   firstUserMessage?: string | null,
@@ -765,7 +781,9 @@ export function listSessionsFromStore(params: {
       const id = parsed?.id;
       const origin = entry?.origin;
       const originLabel = origin?.label;
+      const preferredAgentDisplayName = resolveAgentSessionDisplayName(cfg, key);
       const displayName =
+        preferredAgentDisplayName ??
         entry?.displayName ??
         (channel
           ? buildGroupDisplayName({
